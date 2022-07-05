@@ -1,0 +1,152 @@
+theory SecureLockingState
+begin
+
+builtins: symmetric-encryption, signing
+
+functions:
+  hmac/2, increment/1
+
+equations:
+  fst(<x.1, x.2>) = x.1,
+  snd(<x.1, x.2>) = x.2
+
+restriction Eq_testing: "All x y #i. Eq( x, y ) @ i ==> x = y"
+
+restriction Single_Provision:  "All #i #j x. Provision( x ) @ i & Provision( x ) @ j ==> #i = #j"
+restriction Single_Oem_Init:   "All #i #j. Oem_Init() @ i & Oem_Init() @ j ==> #i = #j"
+
+/*
+ * The rules below specify the domain of the replay counter.
+ * They model the finite number of possible counter values.
+ * They're also essential for Tamarin in order to finish the proof,
+ * as the state space is infinite if left unbound.
+ */
+rule Allow_Cnt_0: [ !DeviceKey(D, DK), DeviceState(D, <'0','disallow'>) ] --> [ DeviceState(D, <'0','allow'>) ]
+rule Allow_Cnt_1: [ !DeviceKey(D, DK), DeviceState(D, <increment('0'),'disallow'>) ] --> [ DeviceState(D, <increment('0'),'allow'>) ]
+rule Allow_Cnt_2: [ !DeviceKey(D, DK), DeviceState(D, <increment(increment('0')),'disallow'>) ] --> [ DeviceState(D, <increment(increment('0')),'allow'>) ]
+rule Allow_Cnt_3: [ !DeviceKey(D, DK), DeviceState(D, <increment(increment(increment('0'))),'disallow'>) ] --> [ DeviceState(D, <increment(increment(increment('0'))),'allow'>) ]
+
+rule Oem_Init:
+  [
+    Fr(~skOem)
+  ] --[
+    Oem_Init()
+  ]-> [
+    !OemSecretKey(~skOem),
+    !OemPublicKey(pk(~skOem))
+  ]
+
+rule Oem_Sign:
+  let in_Request      = <D,cnt,sid>
+      Signature       = sign(in_Request, skOem)
+      out_Certificate = <in_Request, Signature> in
+  [
+    In (in_Request),
+
+    !OemSecretKey(skOem),
+    !SharedKey(D, SK)
+  ] --[
+    DeviceEligible(D,cnt,sid)
+  ]-> [
+    Out (senc(out_Certificate, SK))
+  ]
+
+rule Device_Provision:
+  [
+    Fr(~DEK), Fr(~DK), Fr(~SK)
+  ] --[
+    AssumeDekSecure($D, ~DEK),
+    Provision($D)
+  ]-> [
+    DeviceState($D, <'0', 'disallow'>),
+    !DeviceKey($D, ~DK),
+    !SharedKey($D, ~SK),
+
+    Out (senc(~DEK, hmac(<'0','locked'>, ~DK)))
+  ]
+
+rule Boot_Unlocked:
+  let KEK            = hmac(<cnt,'unlocked'>, DK)
+      DEK            = sdec(in_DEK_enc, KEK)
+      ExpectedData   = <D,cnt,'unlocked'>
+      in_Certificate = <ExpectedData, Signature> in
+  [ 
+    In (in_DEK_enc),
+    In (in_Certificate),
+
+    DeviceState(D, <cnt, 'allow'>),
+    !DeviceKey(D, DK),
+    !OemPublicKey(pkOem)
+  ] --[
+    LeakDek(D, DEK),
+    Eq (verify(Signature, ExpectedData, pkOem), true)
+  ]-> [
+    Out(DEK)
+  ]
+
+rule LockState_Downgrade:
+  let KEK             = hmac(<increment(cnt),'unlocked'>, DK)
+      Data            = <D,increment(cnt),'unlocked'>
+      out_Certificate = sdec(in_Certificate_enc, SK)
+      Data            = fst(out_Certificate)
+      Signature       = snd(out_Certificate)
+      out_DEK_enc     = senc(~NewDek, KEK) in
+  [
+    In (in_Certificate_enc),
+    Fr(~NewDek),
+    
+    DeviceState(D, <cnt, 'allow'>),
+    !DeviceKey(D, DK),
+    !SharedKey(D, SK),
+    !OemPublicKey(pkOem)
+  ] --[
+    Downgrade(D,cnt),
+    Eq (verify(Signature, Data, pkOem), true)
+  ]-> [
+    DeviceState(D, <increment(cnt), 'disallow'>),
+
+    Out (out_DEK_enc),
+    Out (out_Certificate)
+  ]
+
+rule LockState_Upgrade:
+  let KEK            = hmac(<cnt,'unlocked'>, DK)
+      KEKnew         = hmac(<increment(cnt),'locked'>, DK)
+      Data           = <D,increment(cnt),'locked'>
+      out_Certificate = sdec(in_Certificate_enc, SK)
+      Data           = fst(out_Certificate)
+      Signature      = snd(out_Certificate)
+      DEK            = sdec(in_DEK_enc, KEK)
+      out_DEK_enc    = senc(DEK, KEKnew) in
+  [
+    In (in_Certificate_enc),
+    In (in_DEK_enc),
+
+    DeviceState(D, <cnt, 'allow'>),
+    !DeviceKey(D, DK),
+    !SharedKey(D, SK),
+    !OemPublicKey(pkOem)
+  ] --[
+    AssumeDekSecure(D, DEK),
+    Eq (verify(Signature, Data, pkOem), true)
+  ]-> [
+    DeviceState(D, <increment(cnt), 'disallow'>),
+
+    Out (out_DEK_enc),
+    Out (out_Certificate)
+  ]
+
+lemma dek_secrecy:
+"
+  ( All D dek #i. AssumeDekSecure(D, dek) @ #i ==>
+     not (Ex #j. K(dek) @ #j & #i < #j)
+  )
+"
+lemma only_downgrade_eligible:
+"
+  ( All D cnt #i. Downgrade(D,cnt) @ #i ==>
+     (Ex #j. DeviceEligible(D,cnt,'unlocked') @ #j & #i < #j)
+  )
+"
+
+end

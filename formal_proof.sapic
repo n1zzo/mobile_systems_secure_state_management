@@ -1,0 +1,144 @@
+theory SecureLockingState
+begin
+
+builtins: signing, symmetric-encryption
+
+functions:
+  hmac/2, increment/1
+
+equations:
+  fst(<x.1, x.2>) = x.1,
+  snd(<x.1, x.2>) = x.2
+
+let Oem_Sign = (
+  in (in_Request);
+
+  let cnt             = fst(in_Request) in
+  let sid             = snd(in_Request) in
+  let Signature       = sign(in_Request, skOem) in
+  let out_Certificate = <in_Request, Signature> in
+
+  event DeviceEligible(cnt,sid);
+
+  out (out_Certificate)
+)
+
+let Boot_Unlocked = (
+  in (in_DEK_enc);
+  in (in_Certificate);
+
+  let ExpectedData             = fst(in_Certificate) in
+  let Signature                = snd(in_Certificate) in
+  let cnt                      = fst(ExpectedData) in
+  let sid                      = snd(ExpectedData) in
+  let KEK                      = hmac(<cnt,'unlocked'>, DK) in
+  let DEK                      = sdec(in_DEK_enc, KEK) in
+
+  if verify(Signature, ExpectedData, pk(skOem)) = true then (
+    if sid = 'unlocked' then (
+      lookup 'state' as state in
+      if cnt = state then (
+        out (DEK)
+      )
+    )
+  )
+)
+
+let LockState_Downgrade = (
+  in(in_Certificate_enc);
+
+  let out_Certificate = sdec(in_Certificate_enc, SK) in
+  let Data            = fst(out_Certificate) in
+  let Signature       = snd(out_Certificate) in
+  let cnt             = fst(Data) in
+  let sid             = snd(Data) in  
+
+  if verify(Signature, Data, pk(skOem)) = true then (
+    if sid = 'unlocked' then (
+      /* Upper bound for the replay counter */
+      if cnt = increment(increment('0')) then 0 else (
+        lock 'state'; lookup 'state' as state in
+        if cnt = increment(state) then (
+          new newDEK;
+
+          let KEK         = hmac(<cnt,'unlocked'>, DK) in
+          let out_DEK_enc = senc(newDEK, KEK) in
+
+          event Downgrade(cnt);
+
+          out (out_DEK_enc);
+          out (out_Certificate);
+
+          insert 'state',cnt;
+          unlock 'state'
+        ) else unlock 'state'
+      )
+    )
+  )
+)
+
+let LockState_Upgrade = (
+  in(in_DEK_enc);
+  in(in_Certificate_enc);
+
+  let out_Certificate = sdec(in_Certificate_enc, SK) in
+  let Data            = fst(out_Certificate) in
+  let Signature       = snd(out_Certificate) in
+  let cnt             = fst(Data) in
+  let sid             = snd(Data) in
+
+  if verify(Signature, Data, pk(skOem)) = true then (
+    if sid = 'locked' then (
+      /* Upper bound for the replay counter */
+      if cnt = increment(increment(increment('0'))) then 0 else (
+        lock 'state'; lookup 'state' as state in
+        if cnt = increment(state) then (
+          let KEK         = hmac(<state,'unlocked'>, DK) in
+          let DEK         = sdec(in_DEK_enc, KEK) in
+          let KEK_new     = hmac(<cnt,'locked'>, DK) in
+          let out_DEK_enc = senc(DEK, KEK_new) in
+
+          event AssumeDekSecure(DEK);
+      
+          out (out_DEK_enc);
+          out (out_Certificate);
+          insert 'state',cnt;
+          unlock 'state'
+        ) else unlock 'state'
+      )
+    )
+  )
+)
+
+!(new skOem;
+  new DEK;
+  new DK;
+  new SK;
+
+  let KEK         = hmac(<'0','locked'>, DK) in
+  let out_DEK_enc = senc(DEK, KEK) in
+
+  insert 'state','0';
+  event NewDek(DEK);
+  event AssumeDekSecure(DEK);
+
+  out (pk(skOem));
+  out (out_DEK_enc);
+
+   ( !Oem_Sign || !Boot_Unlocked || !LockState_Downgrade || !LockState_Upgrade )
+)
+
+lemma dek_secrecy:
+"
+  ( All dek #i. AssumeDekSecure(dek) @ #i ==>
+     not (Ex #j. K(dek) @ #j & #i < #j)
+  )
+"
+
+lemma only_downgrade_eligible:
+"
+  ( All cnt #i. Downgrade(cnt) @ #i ==>
+     (Ex #j. DeviceEligible(cnt,'unlocked') @ #j & #i < #j)
+  )
+"
+end
